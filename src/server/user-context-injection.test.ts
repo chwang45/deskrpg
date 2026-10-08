@@ -16,6 +16,7 @@ import {
 } from "../test-setup/npc-seed";
 import oldMap from "../lib/fixtures/official-agency-v2.json";
 import { deriveChannelMotionLayout } from "./channel-motion-layout";
+import { formatAssignedWork } from "../lib/assigned-work";
 import { formatReportFormat } from "../lib/report-format";
 setupThrowawaySqlite("user-context-injection");
 
@@ -28,6 +29,7 @@ const deadlineMs = 10_000;
 // The report-format rule follows the conversation-partner line — both are at the head of the message; SOUL is untouched.
 const EXPECTED_HEADER =
   "[대화 상대] 이름: 곽지호 · 소개: 단테랩스 대표. 존댓말 선호.\n\n" +
+  `${formatAssignedWork([], "ko")}\n\n` +
   `${formatReportFormat()}\n\n`;
 
 const event = <T>(client: Socket, name: string) =>
@@ -43,6 +45,7 @@ test("the body sent to the gateway from DM/meeting starts with [대화 상대]·
   t.mock.timers.enable({ apis: ["setInterval"] });
   const { db, channels, characters, channelMembers, jsonForDb } = await import("../db");
   const { setupSocketHandlers, adapterRegistry } = await import("./socket-handlers");
+  const { setMultiAgentTaskRunner } = await import("../lib/ai/router");
   const { DEV_JWT_SECRET } = await import("../lib/dev-constants");
 
   const user = await seedUser();
@@ -68,7 +71,19 @@ test("the body sent to the gateway from DM/meeting starts with [대화 상대]·
     .where(eq(channels.id, channel.id));
 
   const prompts: Array<{ sessionKey: string; prompt: string }> = [];
+  const dmPrompts: string[] = [];
   let promptArrived: (() => void) | null = null;
+  let dmArrived: (() => void) | null = null;
+  setMultiAgentTaskRunner(async (prompt) => {
+    dmPrompts.push(prompt);
+    dmArrived?.();
+    return {
+      plan: { subtasks: [], synthesisInstructions: "" },
+      workerResults: [],
+      finalAnswer: "네",
+    };
+  });
+  t.after(() => setMultiAgentTaskRunner(null));
   adapterRegistry.register({
     type: "user-context-capture",
     testConnection: async () => ({ status: "ok" }),
@@ -85,6 +100,15 @@ test("the body sent to the gateway from DM/meeting starts with [대화 상대]·
         clearTimeout(timeout);
         promptArrived = null;
         resolve(prompts.at(-1)!);
+      };
+    });
+  const nextDmPrompt = () =>
+    new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(Error("no router prompt")), deadlineMs);
+      dmArrived = () => {
+        clearTimeout(timeout);
+        dmArrived = null;
+        resolve(dmPrompts.at(-1)!);
       };
     });
 
@@ -138,11 +162,10 @@ test("the body sent to the gateway from DM/meeting starts with [대화 상대]·
 
     // DM: the socket chat cooldown (2s) is shared with the meeting, so send after it.
     await new Promise((r) => setTimeout(r, Math.max(0, meetingSentAt + 2_100 - Date.now())));
-    const dmPrompt = nextPrompt();
+    const dmPrompt = nextDmPrompt();
     client.emit("npc:chat", { npcId: npc.id, message: "안녕하세요", sourceMessageId: "dm-1" });
     const dm = await dmPrompt;
-    assert.match(dm.sessionKey, /-dm-/);
-    assert.equal(dm.prompt, `${EXPECTED_HEADER}안녕하세요`);
+    assert.equal(dm, `${EXPECTED_HEADER}안녕하세요`);
   } finally {
     client.disconnect();
     io.close();

@@ -77,8 +77,11 @@
     "capture:readme:verify": "tsx scripts/readme-capture/verify-readme.ts"
   },
   "dependencies": {
+    "@ai-sdk/groq": "^4.0.54",
+    "@ai-sdk/openai": "^4.0.83",
     "@codemirror/language": "^6.12.4",
     "@codemirror/language-data": "^6.5.2",
+    "ai": "^7.0.127",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "12.8.0",
     "codemirror": "^6.0.2",

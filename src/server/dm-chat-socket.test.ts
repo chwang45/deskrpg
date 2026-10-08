@@ -7,7 +7,8 @@ setupThrowawaySqlite("chat-response-dm-socket");
 import { db, characters, npcs } from "@/db";
 import { DEV_JWT_SECRET } from "@/lib/dev-constants";
 import type { ChatResponse } from "@/lib/chat-response";
-import { adapterRegistry, setupSocketHandlers } from "./socket-handlers";
+import { setMultiAgentTaskRunner } from "@/lib/ai/router";
+import { setupSocketHandlers } from "./socket-handlers";
 
 test("DM socket sends correlated live state, restores history without duplicate IDs, and reports failed persistence", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });
@@ -26,16 +27,20 @@ test("DM socket sends correlated live state, restores history without duplicate 
   const ready = new Promise<void>((resolve) => {
     notify = resolve;
   });
-  adapterRegistry.register({
-    type: "ux-test",
-    testConnection: async () => ({ status: "ok" }),
-    execute: async (options) => {
-      options.onDelta?.("hello");
+  let calls = 0;
+  setMultiAgentTaskRunner(async () => {
+    calls += 1;
+    if (calls === 1) {
       notify();
       await gate;
-      return { response: "hello world", session: { sessionRef: options.sessionKey } };
-    },
+    }
+    return {
+      plan: { subtasks: [], synthesisInstructions: "" },
+      workerResults: [],
+      finalAnswer: "hello world",
+    };
   });
+  t.after(() => setMultiAgentTaskRunner(null));
   const events: [string, unknown][] = [];
   const payloads = <T>(event: string): T[] =>
     events.filter(([name]) => name === event).map(([, p]) => p as T);
@@ -99,9 +104,9 @@ test("DM socket sends correlated live state, restores history without duplicate 
   await run;
   assert.deepEqual(
     beforeFinal.map((r) => r.status),
-    ["queued", "thinking", "streaming"],
+    ["queued", "thinking"],
   );
-  assert.equal(beforeFinal.at(-1)?.content, "hello");
+  assert.equal(beforeFinal.at(-1)?.content, "");
   const final = payloads<{ response: ChatResponse }>("npc:response-state").at(-1)!.response;
   assert.equal(final.status, "complete");
   assert.equal(final.content, "hello world");

@@ -18,7 +18,8 @@ import {
 } from "./meeting-spatial-coordinator";
 import { deriveChannelMotionLayout, closestValidUnoccupiedSpawn } from "./channel-motion-layout";
 import { ChatResponseTracker, SessionQueue } from "./chat-response-tracker";
-import { runTrackedDm, executeDmAdapter } from "./dm-response-runtime";
+import { runTrackedDm } from "./dm-response-runtime";
+import { executeMultiAgentTask } from "@/lib/ai/router";
 import { Server, Socket } from "socket.io";
 import type { NpcAdapter } from "../lib/adapters/types";
 import {
@@ -50,7 +51,6 @@ import {
   chatMessages,
   jsonForDb,
 } from "../db";
-import { describeActivity } from "@/lib/npc-activity";
 import { readLocaleCookie } from "@/lib/i18n/server";
 import { composeNpcInstructions } from "@/lib/npc-prompt-layers";
 import { getDefaultMeetingProtocol } from "@/lib/meeting-protocol";
@@ -121,8 +121,8 @@ import {
 } from "@/lib/meeting-outcome";
 import { announceMeetingOutcome } from "@/lib/meeting-outcome-notice";
 import { registerMeetingHooks } from "@/lib/meeting-registry";
-import { prefixReportFormat } from "@/lib/report-format";
-import { prefixUserContext, type UserContext } from "@/lib/user-context";
+import { loadAssignedWork, prefixEmployeePrompt } from "@/lib/assigned-work";
+import { type UserContext } from "@/lib/user-context";
 import { AdapterRegistry } from "../lib/adapters/types.js";
 import { createApprovalSummarizer, runApprovalSummaryAsNpc } from "./tool-approval-summary";
 import {
@@ -174,6 +174,8 @@ interface NpcConfig {
   passPolicy?: string | null;
   /** Language of the prompt document. Task procedures are built in that language. */
   locale?: string | null;
+  /** Hermes profile id used to read this employee's DeskRPG cards. */
+  profileName?: string | null;
   /**
    * System instructions attached to this NPC's turn. getNpcConfig* assembles the layers to fill it —
    * callers don't compute anything and only read this field. 1:1, meetings and channel mentions use the same value.
@@ -544,6 +546,7 @@ async function getNpcConfig(
       role: "Participant",
       passPolicy: typeof oc.passPolicy === "string" ? oc.passPolicy : null,
       locale: typeof oc.locale === "string" ? oc.locale : null,
+      profileName: npc.profile.profileName,
       instructions: resolveNpcInstructions(oc, requestLocale),
     };
   } catch (err) {
@@ -575,6 +578,7 @@ export async function getNpcConfigsForChannel(
         _channelId: channelId,
         _name: npc.name,
         locale: typeof oc.locale === "string" ? oc.locale : null,
+        profileName: npc.profile.profileName,
         instructions: resolveNpcInstructions(oc, requestLocale),
         role: "Participant",
         passPolicy: typeof oc.passPolicy === "string" ? oc.passPolicy : null,
@@ -590,146 +594,76 @@ export async function getNpcConfigsForChannel(
 // Gateway streaming — 1:1 DM chat
 // ---------------------------------------------------------------------------
 
+function cancelledDm(): Error {
+  return Object.assign(new Error("DM cancelled"), { name: "AbortError" });
+}
+
+/** Settles when the user hits stop, even if the model call is still in flight. */
+function answerDirectMessage(
+  prompt: string,
+  instructions: string | undefined,
+  signal?: AbortSignal,
+) {
+  if (signal?.aborted) return Promise.reject(cancelledDm());
+  const task = executeMultiAgentTask(prompt, undefined, { abortSignal: signal, instructions });
+  if (!signal) return task;
+  return new Promise<Awaited<typeof task>>((resolve, reject) => {
+    const onAbort = () => reject(cancelledDm());
+    signal.addEventListener("abort", onAbort, { once: true });
+    task.then(
+      (result) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function streamNpcResponse(
   socket: Socket,
   npcId: string,
   npcConfig: NpcConfig,
-  userId: string,
+  _userId: string,
   message: string,
   attachments?: GatewayAttachment[],
-  sessionKeyOverride?: string,
+  _sessionKeyOverride?: string,
   emitEvent?: string,
   signal?: AbortSignal,
 ): Promise<string> {
-  const { _channelId, sessionKeyPrefix, adapterType, hermesProfileId } = npcConfig;
   const responseEvent = emitEvent || "npc:response";
-  const sessionKey = sessionKeyOverride || `${sessionKeyPrefix || npcId}-dm-${userId}`;
-  // The conversation-partner line and report-format rules are prepended to the message — the system prompt
-  // (instructions) isn't touched. Order is "who you're talking to" → "how to report" → the actual body.
+  // The conversation-partner line, the employee's cards, and the report-format rules are prepended
+  // to the message. Employee instructions go to the router separately.
   const locale = socketLocale(socket);
-  const prompt = prefixUserContext(
-    prefixReportFormat(message, locale),
-    userContextOf(socket),
-    locale,
-  );
+  const work = npcConfig.profileName ? loadAssignedWork(npcConfig.profileName, locale) : null;
+  const prompt = prefixEmployeePrompt(message, userContextOf(socket), work, locale);
 
-  const dispatchKind = classifyNpcDispatch({ adapterType, hermesProfileId });
-
-  if (dispatchKind === "unbound") {
-    emitNpcSystemResponse(socket, npcId, "npc_unbound");
-    return "";
-  }
-
-  if (dispatchKind === "hermes") {
-    const hermesAdapter = await createHermesAdapterForNpc(
+  if (attachments?.some((a) => a.type === "image")) {
+    socket.emit(responseEvent, {
       npcId,
-      userId,
-      deriveHermesContextKey(sessionKey, sessionKeyPrefix || npcId),
-    );
-    if (!hermesAdapter) {
-      emitNpcSystemResponse(socket, npcId, "npc_unbound");
-      return "";
-    }
-    // The approver of a 1:1 run is the user who talked to the NPC — and the one its questions go to.
-    const approvals = routeToolApprovals(hermesAdapter, {
-      npcId,
-      channelId: _channelId,
-      context: "dm",
-      approver: () => ({ userId, name: userContextOf(socket)?.name ?? playerNameOf(userId) }),
+      chunk: "",
+      done: false,
+      messageCode: "hermes_image_unsupported",
     });
-    const adapter = sessionKeyOverride
-      ? approvals
-      : routeAskUser(approvals, { npcId, userId, channelId: _channelId });
-
-    if (attachments?.some((a) => a.type === "image")) {
-      socket.emit(responseEvent, {
-        npcId,
-        chunk: "",
-        done: false,
-        messageCode: "hermes_image_unsupported",
-      });
-    }
-
-    try {
-      const { response, session } = await executeDmAdapter(
-        adapter,
-        {
-          sessionKey,
-          prompt,
-          instructions: npcConfig.instructions,
-          onDelta: (delta: string) => {
-            socket.emit(responseEvent, { npcId, chunk: delta, done: false });
-          },
-          // tool.progress is a progress signal, not an answer. So only the **tool name** is used and
-          // the delta body is discarded — measured (v0.20.2), the `_thinking` tool sends the complete answer
-          // once more in the delta; previously this was streamed as chat chunks and in 1:1 conversations
-          // the answer showed up exactly twice. The body path (onDelta) and the activity path are fully separated,
-          // so that bug structurally cannot recur.
-          onToolProgress: (toolName: string) => {
-            // An empty name means "the tool finished" (tool.completed) — turn the indicator off.
-            const notice = describeActivity(toolName);
-            socket.emit("npc:activity", { npcId, activityKey: notice?.key ?? null });
-          },
-          onRunStarted: (runId: string) => {
-            registerHermesRun(sessionKey, runId);
-          },
-        },
-        undefined,
-        signal,
-      );
-      socket.emit(responseEvent, { npcId, chunk: "", done: true });
-      await persistHermesSessionRef(
-        npcId,
-        userId,
-        deriveHermesContextKey(sessionKey, sessionKeyPrefix || npcId),
-        session.sessionRef,
-      );
-      return response || "";
-    } catch (err) {
-      console.error("[npc] Hermes adapter error for " + npcId + ":", err);
-      emitNpcSystemResponse(socket, npcId, gatewayFailureMessageCode(err));
-      return "";
-    } finally {
-      clearHermesRun(sessionKey);
-      // Always turn the activity indicator off, success or failure — if left on it becomes "searching forever".
-      socket.emit("npc:activity", { npcId, activityKey: null });
-    }
   }
 
-  // dispatchKind === "registry"
-  if (adapterRegistry.has(adapterType)) {
-    const adapter = adapterRegistry.get(adapterType);
-
-    try {
-      const { response } = await executeDmAdapter(
-        adapter,
-        {
-          sessionKey,
-          prompt,
-          instructions: npcConfig.instructions,
-          attachments,
-          model:
-            typeof npcConfig.adapterConfig.model === "string"
-              ? npcConfig.adapterConfig.model
-              : undefined,
-          onDelta: (delta: string) => {
-            socket.emit(responseEvent, { npcId, chunk: delta, done: false });
-          },
-          timeoutMs: 180_000,
-        },
-        undefined,
-        signal,
-      );
-      socket.emit(responseEvent, { npcId, chunk: "", done: true });
-      return response || "";
-    } catch (err) {
-      console.error("[npc] " + adapterType + " adapter error for " + npcId + ":", err);
-      emitNpcSystemResponse(socket, npcId, gatewayFailureMessageCode(err));
-      return "";
-    }
-  } else {
-    emitNpcSystemResponse(socket, npcId, "unsupported_adapter");
+  try {
+    const { finalAnswer } = await answerDirectMessage(prompt, npcConfig.instructions, signal);
+    if (signal?.aborted) return "";
+    const text = (finalAnswer || "").trim();
+    if (text) socket.emit(responseEvent, { npcId, chunk: text, done: false });
+    socket.emit(responseEvent, { npcId, chunk: "", done: true });
+    return text;
+  } catch (err) {
+    if (signal?.aborted) return "";
+    console.error("[npc] router error for " + npcId + ":", err);
+    emitNpcSystemResponse(socket, npcId, gatewayFailureMessageCode(err));
     return "";
+  } finally {
+    socket.emit("npc:activity", { npcId, activityKey: null });
   }
 }
 
@@ -777,10 +711,11 @@ async function streamMeetingNpcResponse(
   if (dispatchKind === "openclaw" && !agentId) return;
 
   const sessionKey = `${sessionKeyPrefix || _name}-meeting-${channelId}`;
-  // Prepend the speaker's name/bio and report format (the meeting counterpart is the speaker).
-  const prompt = prefixUserContext(
-    prefixReportFormat(`${senderName}: ${userMessage}`, locale),
+  const work = npcConfig.profileName ? loadAssignedWork(npcConfig.profileName, locale) : null;
+  const prompt = prefixEmployeePrompt(
+    `${senderName}: ${userMessage}`,
     userContext,
+    work,
     locale,
   );
 

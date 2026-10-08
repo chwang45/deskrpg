@@ -70,6 +70,26 @@ async function main() {
   };
   const socketHandlers = unwrapTsModule(await import("./src/server/socket-handlers.ts"));
   const { setupSocketHandlers, getRoomUserIds, getSocketIdsForUser } = socketHandlers;
+  const chiokbotRouter = unwrapTsModule(await import("./src/server/chiokbot-router-server.ts"));
+  const { handleChiokbotRouterRequest, isDeskRpgChiokbotRoute } = chiokbotRouter;
+
+  // Next owns port 3000. Answer Chi-OkBot commands on that same listener
+  // before the page handler sees them.
+  const http = require("node:http");
+  const originalCreateServer = http.createServer;
+  http.createServer = function chiokbotCreateServer(...args) {
+    const listenerIndex = args.findIndex((arg) => typeof arg === "function");
+    if (listenerIndex === -1) return originalCreateServer.apply(this, args);
+    const requestListener = args[listenerIndex];
+    args[listenerIndex] = (req, res) => {
+      if (isDeskRpgChiokbotRoute(req.url, req.method)) {
+        void handleChiokbotRouterRequest(req, res);
+        return;
+      }
+      return requestListener(req, res);
+    };
+    return originalCreateServer.apply(this, args);
+  };
 
   // Start Next.js (this creates and listens on the HTTP server)
   await startServer({
@@ -85,8 +105,6 @@ async function main() {
   // startServer returns { port, hostname } but the HTTP server is
   // already listening. We need to access it differently.
   //
-  // Alternative: use the http module to find the listening server
-  const http = require("node:http");
   // Simpler: create Socket.io on a separate internal port, proxy via Caddy path
   const SOCKET_PORT = currentPort + 1; // 3001
   const socketHttpServer = http.createServer();

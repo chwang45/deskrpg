@@ -7,8 +7,8 @@ setupThrowawaySqlite("dm-failure-reason-socket");
 import { db, characters, npcs } from "@/db";
 import { DEV_JWT_SECRET } from "@/lib/dev-constants";
 import type { ChatResponse } from "@/lib/chat-response";
-import { HermesError } from "@/lib/hermes/hermes-client";
-import { adapterRegistry, setupSocketHandlers } from "./socket-handlers";
+import { setMultiAgentTaskRunner } from "@/lib/ai/router";
+import { setupSocketHandlers } from "./socket-handlers";
 
 // Measured on staging (Hermes 0.21.2) with an expired openai-codex sign-in; the key is masked.
 const PROVIDER_TEXT =
@@ -26,13 +26,10 @@ test("a DM the provider rejected fails with its cause and without the provider's
     .returning();
   const npcId = seed.npcIds[0];
   await db.update(npcs).set({ adapterType: "dm-provider-auth" }).where(eq(npcs.id, npcId));
-  adapterRegistry.register({
-    type: "dm-provider-auth",
-    testConnection: async () => ({ status: "ok" }),
-    execute: async () => {
-      throw new HermesError("run_failed", PROVIDER_TEXT, 200);
-    },
+  setMultiAgentTaskRunner(async () => {
+    throw new Error(PROVIDER_TEXT);
   });
+  t.after(() => setMultiAgentTaskRunner(null));
 
   const events: [string, unknown][] = [];
   const handlers = new Map<string, (payload: unknown) => Promise<void>>();
@@ -77,7 +74,7 @@ test("a DM the provider rejected fails with its cause and without the provider's
     .map(([, p]) => (p as { response: ChatResponse }).response)
     .at(-1)!;
   assert.equal(final.status, "failed");
-  assert.equal(final.error, "provider_auth_expired");
+  assert.equal(final.error, "gateway_unknown_error");
   const wire = JSON.stringify(events);
   assert.equal(wire.includes("Incorrect API key"), false, "provider text reached the client");
   assert.equal(wire.includes("sk-test"), false, "a key fragment reached the client");

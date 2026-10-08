@@ -7,7 +7,8 @@ setupThrowawaySqlite("dm-cancel-socket");
 import { db, characters, npcs } from "@/db";
 import { DEV_JWT_SECRET } from "@/lib/dev-constants";
 import type { ChatResponse } from "@/lib/chat-response";
-import { adapterRegistry, setupSocketHandlers } from "./socket-handlers";
+import { setMultiAgentTaskRunner } from "@/lib/ai/router";
+import { setupSocketHandlers } from "./socket-handlers";
 
 // The stop button: npc:cancel-response ends the requester's own DM, stops the backend run, and
 // leaves no NPC reply behind. Nobody else can stop it.
@@ -70,18 +71,16 @@ test("the requester can stop a running DM; another user cannot", async (t) => {
     started = resolve;
   });
   let aborts = 0;
-  adapterRegistry.register({
-    type: "cancel-test",
-    testConnection: async () => ({ status: "ok" }),
-    execute: async (options) => {
-      options.onDelta?.("half an");
-      started();
-      return new Promise<never>(() => {});
-    },
-    abort: async () => {
-      aborts += 1;
-    },
+  setMultiAgentTaskRunner((_prompt, _privateContext, options) => {
+    started();
+    return new Promise((_resolve, reject) => {
+      options?.abortSignal?.addEventListener("abort", () => {
+        aborts += 1;
+        reject(Object.assign(new Error("DM cancelled"), { name: "AbortError" }));
+      });
+    });
   });
+  t.after(() => setMultiAgentTaskRunner(null));
 
   const h = harness();
   const owner = await h.open("owner-socket", seed.userId);
@@ -96,7 +95,7 @@ test("the requester can stop a running DM; another user cannot", async (t) => {
   const requestId = h.states().at(-1)!.requestId;
 
   await stranger("npc:cancel-response", { npcId, requestId, characterId: character.id });
-  assert.equal(h.states().at(-1)!.status, "streaming", "another user cannot stop it");
+  assert.equal(h.states().at(-1)!.status, "thinking", "another user cannot stop it");
   assert.equal(aborts, 0);
 
   await owner("npc:cancel-response", { npcId, requestId, characterId: character.id });

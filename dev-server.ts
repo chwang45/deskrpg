@@ -54,7 +54,15 @@ app.prepare().then(async () => {
   // agents.* directly (without depending on a port). Those methods went away with OpenClaw
   // — removed together with the /_internal/rpc bridge in server.js.
 
+  const { handleChiokbotRouterRequest, isDeskRpgChiokbotRoute } = await import(
+    "./src/server/chiokbot-router-server"
+  );
+
   const httpServer = createServer((req, res) => {
+    if (isDeskRpgChiokbotRoute(req.url, req.method)) {
+      void handleChiokbotRouterRequest(req, res);
+      return;
+    }
     if (captureMode && req.method === "GET" && req.url === "/__readme-capture/health") {
       const address = httpServer.address();
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
